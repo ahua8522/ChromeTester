@@ -1,0 +1,17 @@
+# Rust / Tauri 构建产物
+src-tauri/target/
+src-tauri/gen/
+
+# 日志与本地测试临时文件
+*.log
+app-screenshot.png
+shot.png
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,31 @@
+[package]
+name = "chrometester"
+version = "0.1.0"
+description = "ChromeTester - Chrome/Chromium 多版本下载与管理工具"
+edition = "2021"
+
+[lib]
+name = "chrometester_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+zip = "2"
+rfd = "0.15"
+sysinfo = "0.30"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
