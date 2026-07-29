@@ -20,6 +20,10 @@ const SNAPSHOT_DL_BASE: &str = "https://commondatastorage.googleapis.com/chromiu
 const NPM_CFT_BASE: &str = "https://registry.npmmirror.com/-/binary/chrome-for-testing/";
 const NPM_SNAP_BASE: &str = "https://registry.npmmirror.com/-/binary/chromium-browser-snapshots/";
 
+// 内置版本快照（首次启动即时展示、无需联网；可通过“刷新”更新缓存）
+const CHROME_VERSIONS_SNAPSHOT: &str = include_str!("../snapshot/chrome-versions.json");
+const CHROMIUM_MILESTONES_SNAPSHOT: &str = include_str!("../snapshot/chromium-milestones.json");
+
 // ---------- 数据结构 ----------
 
 #[derive(Serialize, Clone)]
@@ -46,6 +50,8 @@ pub struct InstalledVersion {
 pub struct ProfileInfo {
     name: String,
     path: String,
+    /// 自定义启动参数（如 --proxy-server=..., --lang=en-US）
+    args: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -54,6 +60,15 @@ pub struct DownloadProgress {
     status: String, // downloading | extracting | completed | error
     percent: u32,
     error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct UpdateInfo {
+    current: String,
+    latest: String,
+    has_update: bool,
+    url: String,
+    notes: String,
 }
 
 // ---------- 路径工具 ----------
@@ -115,6 +130,59 @@ fn profiles_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = data_dir(app)?.join("profiles");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
+}
+
+// ---------- 多安装路径（记录历史路径，“已安装”全部扫描） ----------
+
+/// 所有需要扫描的安装目录：默认目录 + 当前自定义目录 + 历史用过的目录（去重、仅保留存在的）
+fn all_install_dirs(app: &AppHandle) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let push = |p: PathBuf, dirs: &mut Vec<PathBuf>| {
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    // 当前生效目录（自定义或默认）优先
+    if let Ok(d) = chrome_dir(app) {
+        push(d, &mut dirs);
+    }
+    // 默认目录
+    if let Ok(base) = data_dir(app) {
+        push(base.join("chrome"), &mut dirs);
+    }
+    // 历史目录
+    let cfg = load_config(app);
+    if let Some(arr) = cfg["install_dirs"].as_array() {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                push(PathBuf::from(s), &mut dirs);
+            }
+        }
+    }
+    dirs
+}
+
+/// 在所有安装目录中定位某个版本的目录
+fn find_version_dir(app: &AppHandle, version: &str) -> Option<PathBuf> {
+    for d in all_install_dirs(app) {
+        let p = d.join(version);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// 把目录记入历史（install_dirs），用于切换路径后仍能扫到旧版本
+fn record_install_dir(cfg: &mut serde_json::Value, path: &str) {
+    let arr = cfg
+        .as_object_mut()
+        .and_then(|o| o.entry("install_dirs").or_insert(serde_json::json!([])).as_array_mut());
+    if let Some(arr) = arr {
+        if !arr.iter().any(|v| v.as_str() == Some(path)) {
+            arr.push(serde_json::json!(path));
+        }
+    }
 }
 
 /// 当前平台标识（与Chrome for Testing API对应）
@@ -268,97 +336,151 @@ fn download_client() -> &'static reqwest::Client {
 
 // ---------- Commands ----------
 
-#[tauri::command]
-async fn get_available_versions(app: AppHandle) -> Result<Vec<VersionInfo>, String> {
-    let platform = current_platform();
-    let mut versions = if download_source(&app) == "npmmirror" {
-        fetch_cft_versions_npm(platform).await?
+/// 构造某个版本的下载地址（根据当前下载源）
+fn cft_download_url(source: &str, version: &str, platform: &str) -> String {
+    if source == "npmmirror" {
+        format!("{NPM_CFT_BASE}{version}/{platform}/chrome-{platform}.zip")
     } else {
-        fetch_cft_versions_google(platform).await?
-    };
-    // 按版本号倒序排列
-    versions.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
-    Ok(versions)
+        format!(
+            "https://storage.googleapis.com/chrome-for-testing-public/{version}/{platform}/chrome-{platform}.zip"
+        )
+    }
 }
 
-/// Google 官方 Chrome for Testing 版本列表
-async fn fetch_cft_versions_google(platform: &str) -> Result<Vec<VersionInfo>, String> {
-    let resp = http_client()
-        .get(CFT_API)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    let empty = vec![];
-    Ok(data["versions"]
-        .as_array()
-        .unwrap_or(&empty)
-        .iter()
-        .filter_map(|v| {
-            let version = v["version"].as_str()?.to_string();
-            let url = v["downloads"]["chrome"]
-                .as_array()?
-                .iter()
-                .find(|d| d["platform"].as_str() == Some(platform))?["url"]
-                .as_str()?
-                .to_string();
-            Some(VersionInfo {
-                version,
-                download_url: url,
-            })
-        })
-        .collect())
+/// 从本地缓存或内置快照读取版本字符串列表（不联网）
+fn load_version_strings(app: &AppHandle) -> Vec<String> {
+    let text = data_dir(app)
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join("versions-cache.json")).ok())
+        .unwrap_or_else(|| CHROME_VERSIONS_SNAPSHOT.to_string());
+    serde_json::from_str::<Vec<String>>(&text)
+        .or_else(|_| serde_json::from_str::<Vec<String>>(CHROME_VERSIONS_SNAPSHOT))
+        .unwrap_or_default()
 }
 
-/// npmmirror 镜像 Chrome for Testing 版本列表（从二进制目录列表构建）
-async fn fetch_cft_versions_npm(platform: &str) -> Result<Vec<VersionInfo>, String> {
-    let resp = http_client()
-        .get(NPM_CFT_BASE)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-
-    let empty = vec![];
-    Ok(data
-        .as_array()
-        .unwrap_or(&empty)
-        .iter()
-        .filter_map(|e| {
-            if e["type"].as_str() != Some("dir") {
-                return None;
-            }
-            let version = e["name"].as_str()?.trim_end_matches('/').to_string();
-            if validate_version(&version).is_err() {
-                return None;
-            }
-            let download_url =
-                format!("{NPM_CFT_BASE}{version}/{platform}/chrome-{platform}.zip");
-            Some(VersionInfo {
-                version,
+/// 由版本字符串构造完整的可用版本列表
+fn build_version_list(app: &AppHandle, versions: Vec<String>) -> Vec<VersionInfo> {
+    let source = download_source(app);
+    let platform = current_platform();
+    let mut list: Vec<VersionInfo> = versions
+        .into_iter()
+        .filter(|v| validate_version(v).is_ok())
+        .map(|v| {
+            let download_url = cft_download_url(&source, &v, platform);
+            VersionInfo {
+                version: v,
                 download_url,
-            })
+            }
         })
-        .collect())
+        .collect();
+    list.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
+    list
+}
+
+/// 获取可用版本（本地缓存/内置快照，不联网，启动即时返回）
+#[tauri::command]
+fn get_available_versions(app: AppHandle) -> Result<Vec<VersionInfo>, String> {
+    Ok(build_version_list(&app, load_version_strings(&app)))
+}
+
+/// 刷新：从网络拉取最新版本列表并更新缓存
+#[tauri::command]
+async fn refresh_available_versions(app: AppHandle) -> Result<Vec<VersionInfo>, String> {
+    let source = download_source(&app);
+    let platform = current_platform();
+    let versions = fetch_version_strings(&source, platform).await?;
+    if versions.is_empty() {
+        return Err("未获取到版本列表".into());
+    }
+    if let Ok(d) = data_dir(&app) {
+        let _ = fs::write(
+            d.join("versions-cache.json"),
+            serde_json::to_string(&versions).unwrap_or_default(),
+        );
+    }
+    Ok(build_version_list(&app, versions))
+}
+
+/// 从网络获取版本字符串列表（根据下载源）
+async fn fetch_version_strings(source: &str, platform: &str) -> Result<Vec<String>, String> {
+    let empty = vec![];
+    if source == "npmmirror" {
+        let data: serde_json::Value = http_client()
+            .get(NPM_CFT_BASE)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(data
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|e| e["type"].as_str() == Some("dir"))
+            .filter_map(|e| {
+                let v = e["name"].as_str()?.trim_end_matches('/').to_string();
+                if validate_version(&v).is_ok() {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    } else {
+        let data: serde_json::Value = http_client()
+            .get(CFT_API)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(data["versions"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter_map(|v| {
+                let version = v["version"].as_str()?.to_string();
+                let has = v["downloads"]["chrome"]
+                    .as_array()?
+                    .iter()
+                    .any(|d| d["platform"].as_str() == Some(platform));
+                if has {
+                    Some(version)
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
 }
 
 #[tauri::command]
 fn get_installed_versions(app: AppHandle) -> Result<Vec<InstalledVersion>, String> {
-    let dir = chrome_dir(&app)?;
-    let mut installed: Vec<InstalledVersion> = fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            if !entry.file_type().ok()?.is_dir() {
-                return None;
+    let mut installed: Vec<InstalledVersion> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    // 扫描所有安装目录（当前 + 历史），同名版本以先扫到的为准
+    for dir in all_install_dirs(&app) {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
             }
-            Some(InstalledVersion {
-                version: entry.file_name().to_string_lossy().to_string(),
+            let version = entry.file_name().to_string_lossy().to_string();
+            if seen.contains(&version) {
+                continue;
+            }
+            seen.push(version.clone());
+            installed.push(InstalledVersion {
+                version,
                 path: entry.path().to_string_lossy().to_string(),
-            })
-        })
-        .collect();
+            });
+        }
+    }
 
     installed.sort_by(|a, b| version_key(&b.version).cmp(&version_key(&a.version)));
     Ok(installed)
@@ -479,25 +601,41 @@ async fn download_and_extract(
 // ---------- Chromium历史版本（快照源） ----------
 
 #[tauri::command]
-async fn get_chromium_milestones(app: AppHandle) -> Result<Vec<MilestoneInfo>, String> {
-    let cache = data_dir(&app)?.join("milestones-cache.json");
+fn get_chromium_milestones(app: AppHandle) -> Result<Vec<MilestoneInfo>, String> {
+    Ok(build_milestone_list(&app, load_milestone_pairs(&app)))
+}
 
-    // 里程碑→分支点映射仅 chromiumdash 提供（需梯子）；
-    // 成功后缓存到本地，之后无网/镜像模式也能用（历史里程碑不会变）
-    let pairs: Vec<(u32, u64)> = match fetch_milestone_pairs().await {
-        Ok(p) if !p.is_empty() => {
-            let _ = fs::write(&cache, serde_json::to_string(&p).unwrap_or_default());
-            p
-        }
-        _ => fs::read_to_string(&cache)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Vec<(u32, u64)>>(&s).ok())
-            .filter(|v| !v.is_empty())
-            .ok_or("里程碑列表需一次可访问 chromiumdash 的网络（如梯子）以建立缓存")?,
-    };
+/// 刷新：从 chromiumdash 拉取最新里程碑并更新缓存（需可访问 Google）
+#[tauri::command]
+async fn refresh_chromium_milestones(app: AppHandle) -> Result<Vec<MilestoneInfo>, String> {
+    let pairs = fetch_milestone_pairs().await?;
+    if pairs.is_empty() {
+        return Err("未获取到里程碑列表".into());
+    }
+    if let Ok(d) = data_dir(&app) {
+        let _ = fs::write(
+            d.join("milestones-cache.json"),
+            serde_json::to_string(&pairs).unwrap_or_default(),
+        );
+    }
+    Ok(build_milestone_list(&app, pairs))
+}
 
+/// 从本地缓存或内置快照读取里程碑对（不联网）
+fn load_milestone_pairs(app: &AppHandle) -> Vec<(u32, u64)> {
+    let text = data_dir(app)
+        .ok()
+        .and_then(|d| fs::read_to_string(d.join("milestones-cache.json")).ok())
+        .unwrap_or_else(|| CHROMIUM_MILESTONES_SNAPSHOT.to_string());
+    serde_json::from_str::<Vec<(u32, u64)>>(&text)
+        .or_else(|_| serde_json::from_str::<Vec<(u32, u64)>>(CHROMIUM_MILESTONES_SNAPSHOT))
+        .unwrap_or_default()
+}
+
+/// 由里程碑对构造列表（含当前下载源的快照地址）
+fn build_milestone_list(app: &AppHandle, pairs: Vec<(u32, u64)>) -> Vec<MilestoneInfo> {
     let platform = snapshot_platform();
-    let npm = download_source(&app) == "npmmirror";
+    let npm = download_source(app) == "npmmirror";
     let mut list: Vec<MilestoneInfo> = pairs
         .iter()
         .map(|&(milestone, position)| {
@@ -513,9 +651,8 @@ async fn get_chromium_milestones(app: AppHandle) -> Result<Vec<MilestoneInfo>, S
             }
         })
         .collect();
-
     list.sort_by(|a, b| b.milestone.cmp(&a.milestone));
-    Ok(list)
+    list
 }
 
 /// 从 chromiumdash 获取 (里程碑, 分支点position) 对（仅M113之前）
@@ -601,12 +738,13 @@ async fn resolve_snapshot_google(platform: &str, target: u64) -> Result<String, 
         let digits = &pos_str[..pos_str.len() - cut];
         let mut positions = list_snapshot_positions(client, platform, digits).await?;
         positions.sort_unstable();
-        if let Some(&p) = positions.iter().find(|&&p| p >= target) {
+        // 取小于分支点的最大快照：分支前最后的该里程碑主干构建（否则会拿到下一个里程碑的早期构建）
+        if let Some(&p) = positions.iter().rev().find(|&&p| p < target) {
             chosen = Some(p);
             break;
         }
-        // 全部小于分支点时退而求其次取最大的
-        if let Some(&p) = positions.last() {
+        // 该前缀内都不小于分支点：退而取最接近的
+        if let Some(&p) = positions.iter().min_by_key(|&&p| (p as i128 - target as i128).abs()) {
             chosen = Some(p);
             break;
         }
@@ -670,9 +808,15 @@ async fn resolve_snapshot_npm(platform: &str, target: u64) -> Result<String, Str
     positions.sort_unstable();
     let pos = positions
         .iter()
-        .find(|&&p| p >= target)
+        .rev()
+        .find(|&&p| p < target)
         .copied()
-        .or_else(|| positions.last().copied())
+        .or_else(|| {
+            positions
+                .iter()
+                .min_by_key(|&&p| (p as i128 - target as i128).abs())
+                .copied()
+        })
         .ok_or("镜像快照库中未找到可用构建")?;
 
     // 查该position下的zip文件名
@@ -746,8 +890,8 @@ async fn download_chromium(app: AppHandle, milestone: u32, position: u64) -> Res
 #[tauri::command]
 fn delete_version(app: AppHandle, version: String) -> Result<(), String> {
     validate_version(&version)?;
-    let dir = chrome_dir(&app)?.join(&version);
-    if dir.exists() {
+    // 在所有安装目录中定位后删除
+    if let Some(dir) = find_version_dir(&app, &version) {
         fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -770,10 +914,7 @@ fn open_in_explorer(dir: &PathBuf) -> Result<(), String> {
 #[tauri::command]
 fn open_version_folder(app: AppHandle, version: String) -> Result<(), String> {
     validate_version(&version)?;
-    let dir = chrome_dir(&app)?.join(&version);
-    if !dir.exists() {
-        return Err("目录不存在".into());
-    }
+    let dir = find_version_dir(&app, &version).ok_or("目录不存在")?;
     open_in_explorer(&dir)
 }
 
@@ -824,10 +965,14 @@ async fn pick_install_dir() -> Result<Option<String>, String> {
     .map_err(|e| e.to_string())
 }
 
-/// 设置安装目录；传空字符串则恢复默认
+/// 设置安装目录；传空字符串则恢复默认。切换时把旧目录记入历史，“已安装”仍可扫到旧版本
 #[tauri::command]
 fn set_install_dir(app: AppHandle, path: String) -> Result<(), String> {
     let mut cfg = load_config(&app);
+    // 先把当前生效目录记入历史
+    if let Ok(cur) = chrome_dir(&app) {
+        record_install_dir(&mut cfg, &cur.to_string_lossy());
+    }
     let obj = cfg.as_object_mut().ok_or("配置格式错误")?;
 
     let trimmed = path.trim();
@@ -841,6 +986,8 @@ fn set_install_dir(app: AppHandle, path: String) -> Result<(), String> {
             "install_dir".into(),
             serde_json::json!(dir.to_string_lossy()),
         );
+        // 新目录也记入历史
+        record_install_dir(&mut cfg, &dir.to_string_lossy());
     }
     save_config(&app, &cfg)
 }
@@ -852,41 +999,108 @@ fn open_install_dir(app: AppHandle) -> Result<(), String> {
     open_in_explorer(&dir)
 }
 
-#[tauri::command]
-fn list_profiles(app: AppHandle) -> Result<Vec<ProfileInfo>, String> {
-    let dir = profiles_dir(&app)?;
-    let profiles = fs::read_dir(&dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            if !entry.file_type().ok()?.is_dir() {
-                return None;
-            }
-            Some(ProfileInfo {
-                name: entry.file_name().to_string_lossy().to_string(),
-                path: entry.path().to_string_lossy().to_string(),
-            })
-        })
-        .collect();
-    Ok(profiles)
+// ---------- 浏览器配置（数据目录 + 自定义启动参数） ----------
+// config.json 中 profiles: { "default": [], "work": ["--proxy-server=...", ...] }
+// 数据目录为 profiles/<name>，参数存于配置
+
+fn clean_args(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(50)
+        .collect()
+}
+
+fn load_profiles_obj(app: &AppHandle) -> serde_json::Map<String, serde_json::Value> {
+    let cfg = load_config(app);
+    let mut m = cfg["profiles"].as_object().cloned().unwrap_or_default();
+    if !m.contains_key("default") {
+        m.insert("default".into(), serde_json::json!([]));
+    }
+    m
+}
+
+fn save_profiles_obj(
+    app: &AppHandle,
+    profiles: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let mut cfg = load_config(app);
+    cfg.as_object_mut()
+        .ok_or("配置格式错误")?
+        .insert("profiles".into(), serde_json::Value::Object(profiles));
+    save_config(app, &cfg)
+}
+
+fn profile_args(app: &AppHandle, name: &str) -> Vec<String> {
+    load_profiles_obj(app)
+        .get(name)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default()
 }
 
 #[tauri::command]
-fn create_profile(app: AppHandle, name: String) -> Result<(), String> {
+fn list_profiles(app: AppHandle) -> Result<Vec<ProfileInfo>, String> {
+    let base = profiles_dir(&app)?;
+    let m = load_profiles_obj(&app);
+    let mut out: Vec<ProfileInfo> = m
+        .iter()
+        .map(|(name, v)| {
+            let args = v
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            ProfileInfo {
+                name: name.clone(),
+                path: base.join(name).to_string_lossy().to_string(),
+                args,
+            }
+        })
+        .collect();
+    // default 排最前，其余按名称
+    out.sort_by(|a, b| match (a.name.as_str(), b.name.as_str()) {
+        ("default", "default") => std::cmp::Ordering::Equal,
+        ("default", _) => std::cmp::Ordering::Less,
+        (_, "default") => std::cmp::Ordering::Greater,
+        _ => a.name.cmp(&b.name),
+    });
+    Ok(out)
+}
+
+#[tauri::command]
+fn create_profile(app: AppHandle, name: String, args: Vec<String>) -> Result<(), String> {
     validate_name(&name)?;
-    let dir = profiles_dir(&app)?.join(&name);
-    if dir.exists() {
+    let mut m = load_profiles_obj(&app);
+    if m.contains_key(&name) {
         return Err("配置已存在".into());
     }
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())
+    fs::create_dir_all(profiles_dir(&app)?.join(&name)).map_err(|e| e.to_string())?;
+    m.insert(name, serde_json::json!(clean_args(args)));
+    save_profiles_obj(&app, m)
+}
+
+#[tauri::command]
+fn update_profile(app: AppHandle, name: String, args: Vec<String>) -> Result<(), String> {
+    validate_name(&name)?;
+    let mut m = load_profiles_obj(&app);
+    // 确保数据目录存在（包括首次为 default 设参）
+    fs::create_dir_all(profiles_dir(&app)?.join(&name)).map_err(|e| e.to_string())?;
+    m.insert(name, serde_json::json!(clean_args(args)));
+    save_profiles_obj(&app, m)
 }
 
 #[tauri::command]
 fn delete_profile(app: AppHandle, name: String) -> Result<(), String> {
     validate_name(&name)?;
+    if name == "default" {
+        return Err("默认配置不可删除".into());
+    }
+    let mut m = load_profiles_obj(&app);
+    m.remove(&name);
+    save_profiles_obj(&app, m)?;
     let dir = profiles_dir(&app)?.join(&name);
     if dir.exists() {
-        fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        let _ = fs::remove_dir_all(&dir);
     }
     Ok(())
 }
@@ -910,7 +1124,7 @@ fn launch_chrome(app: AppHandle, version: String, profile: String) -> Result<(),
     validate_version(&version)?;
     validate_name(&profile)?;
 
-    let base = chrome_dir(&app)?.join(&version);
+    let base = find_version_dir(&app, &version).ok_or("未找到该版本目录")?;
 
     // 尝试不同的目录结构定位chrome可执行文件（含Chromium快照的chrome-win等）
     let candidates = [
@@ -936,8 +1150,12 @@ fn launch_chrome(app: AppHandle, version: String, profile: String) -> Result<(),
         .find(|p| p.exists())
         .ok_or("未找到Chrome可执行文件")?;
 
-    // 每个profile独立的user-data-dir实现数据隔离
-    let profile_path = profiles_dir(&app)?.join(&profile);
+    // 数据隔离：default 按版本独立目录（不同版本互不影响、可同时开）；命名配置跨版本共享
+    let profile_path = if profile == "default" {
+        profiles_dir(&app)?.join("default").join(&version)
+    } else {
+        profiles_dir(&app)?.join(&profile)
+    };
     fs::create_dir_all(&profile_path).map_err(|e| e.to_string())?;
 
     // 启动前先结束该profile可能残留的旧实例，保证“关闭后再启动”总能打开新窗口
@@ -945,8 +1163,12 @@ fn launch_chrome(app: AppHandle, version: String, profile: String) -> Result<(),
 
     let mut cmd = Command::new(chrome_path);
     cmd.arg(format!("--user-data-dir={}", profile_path.display()))
-        .arg("--no-first-run")
-        .current_dir(chrome_path.parent().unwrap_or(&base))
+        .arg("--no-first-run");
+    // 追加该配置的自定义启动参数
+    for a in profile_args(&app, &profile) {
+        cmd.arg(a);
+    }
+    cmd.current_dir(chrome_path.parent().unwrap_or(&base))
         // 不继承父进程(GUI)的stdio句柄，避免子进程启动异常退出
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -958,12 +1180,86 @@ fn launch_chrome(app: AppHandle, version: String, profile: String) -> Result<(),
 
 // ---------- 入口 ----------
 
+/// 当前应用版本号
+#[tauri::command]
+fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+const GITHUB_REPO: &str = "ahua8522/ChromeTester";
+
+/// 检查 GitHub 最新 Release，与当前版本比较
+#[tauri::command]
+async fn check_update() -> Result<UpdateInfo, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let releases_page = format!("https://github.com/{GITHUB_REPO}/releases");
+    let api = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+
+    let resp = http_client()
+        .get(&api)
+        .header("User-Agent", "ChromeTester")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 尚未发布任何 Release
+    if resp.status().as_u16() == 404 {
+        return Ok(UpdateInfo {
+            current: current.clone(),
+            latest: current,
+            has_update: false,
+            url: releases_page,
+            notes: "远端尚无正式发布".into(),
+        });
+    }
+    if !resp.status().is_success() {
+        return Err(format!("检查失败: HTTP {}", resp.status()));
+    }
+
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let latest = data["tag_name"]
+        .as_str()
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
+    let url = data["html_url"].as_str().unwrap_or(&releases_page).to_string();
+    let notes: String = data["body"].as_str().unwrap_or("").chars().take(400).collect();
+    let has_update = !latest.is_empty() && version_key(&latest) > version_key(&current);
+
+    Ok(UpdateInfo {
+        current,
+        latest,
+        has_update,
+        url,
+        notes,
+    })
+}
+
+/// 在默认浏览器中打开链接（仅允许 github.com）
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://github.com/") {
+        return Err("非法链接".into());
+    }
+    #[cfg(target_os = "windows")]
+    let r = Command::new("explorer").arg(&url).spawn();
+    #[cfg(target_os = "macos")]
+    let r = Command::new("open").arg(&url).spawn();
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let r = Command::new("xdg-open").arg(&url).spawn();
+    r.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_available_versions,
+            refresh_available_versions,
             get_installed_versions,
             get_chromium_milestones,
+            refresh_chromium_milestones,
             get_download_source,
             set_download_source,
             download_version,
@@ -976,8 +1272,12 @@ pub fn run() {
             open_install_dir,
             list_profiles,
             create_profile,
+            update_profile,
             delete_profile,
             launch_chrome,
+            get_app_version,
+            check_update,
+            open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

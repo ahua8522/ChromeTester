@@ -1,456 +1,147 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ChromeTester</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        html { height: 100%; overflow: hidden; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Microsoft YaHei", sans-serif;
-            background: #0f0f0f;
-            color: #e0e0e0;
-            height: 100vh;
-            overflow: hidden;
-            user-select: none;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-            height: 100vh;
-            display: flex;
-            flex-direction: column;
-        }
-        /* 头部/搜索/开关等固定高度，不参与滚动 */
-        h1, .stats, .tabs, .source-switch, .search-box, .hint,
-        .settings-card, .profile-input { flex-shrink: 0; }
-        h1 {
-            text-align: center;
-            padding: 24px 0;
-            font-size: 26px;
-            color: #fff;
-        }
-        h1 span { color: #4285f4; }
-
-        .tabs {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-        }
-        .tab {
-            padding: 10px 24px;
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .tab:hover { background: #252525; }
-        .tab.active {
-            background: #4285f4;
-            border-color: #4285f4;
-            color: #fff;
-        }
-
-        .panel { display: none; }
-        .panel.active { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-        /* 面板内直接的列表（已安装/配置）自身滚动，页面不滚动 */
-        .panel.active > .version-list { flex: 1; min-height: 0; overflow-y: auto; }
-
-        .search-box {
-            width: 100%;
-            padding: 12px 16px;
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            color: #fff;
-            font-size: 14px;
-            margin-bottom: 16px;
-        }
-        .search-box:focus {
-            outline: none;
-            border-color: #4285f4;
-        }
-
-        .source-switch {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 10px;
-        }
-        .source-btn, .dlsource-btn {
-            padding: 7px 16px;
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 20px;
-            cursor: pointer;
-            font-size: 13px;
-            transition: all 0.2s;
-        }
-        .source-btn:hover, .dlsource-btn:hover { background: #252525; }
-        .source-btn.active, .dlsource-btn.active {
-            background: #1a2f52;
-            border-color: #4285f4;
-            color: #8ab4f8;
-        }
-        .hint {
-            font-size: 12px;
-            color: #666;
-            margin-bottom: 12px;
-            line-height: 1.5;
-        }
-
-        .version-list {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        /* 大版本分组布局：左侧大版本列表 + 右侧具体版本 */
-        .group-layout {
-            display: flex;
-            gap: 12px;
-            align-items: stretch;
-            flex: 1;
-            min-height: 0;
-        }
-        .major-list {
-            width: 150px;
-            flex-shrink: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            min-height: 0;
-            overflow-y: auto;
-            scrollbar-width: thin;
-            scrollbar-color: #333 transparent;
-        }
-        .major-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 10px 14px;
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: 600;
-            font-size: 14px;
-            transition: all 0.2s;
-        }
-        .major-item:hover { background: #252525; border-color: #4285f4; }
-        .major-item.active {
-            background: #4285f4;
-            border-color: #4285f4;
-            color: #fff;
-        }
-        .major-count {
-            font-size: 11px;
-            font-weight: 400;
-            color: #888;
-            background: #2a2a2a;
-            padding: 1px 8px;
-            border-radius: 8px;
-        }
-        .major-item.active .major-count {
-            background: rgba(255, 255, 255, 0.2);
-            color: #fff;
-        }
-        .group-layout .version-list {
-            flex: 1;
-            min-height: 0;
-            overflow-y: auto;
-            scrollbar-width: thin;
-            scrollbar-color: #333 transparent;
-        }
-
-        /* 已安装版本的文件路径 */
-        .version-path {
-            font-size: 12px;
-            color: #777;
-            margin-top: 4px;
-            font-family: Consolas, "Courier New", monospace;
-            word-break: break-all;
-            cursor: pointer;
-        }
-        .version-path:hover { color: #8ab4f8; text-decoration: underline; }
-
-        .version-item {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 14px 18px;
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            transition: all 0.2s;
-        }
-        .version-item:hover {
-            border-color: #4285f4;
-            background: #1e1e1e;
-        }
-        .version-info {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .version-num {
-            font-size: 16px;
-            font-weight: 600;
-            color: #fff;
-        }
-        .version-badge {
-            padding: 2px 8px;
-            background: #333;
-            border-radius: 4px;
-            font-size: 12px;
-        }
-        .version-badge.installed {
-            background: #1b5e20;
-            color: #4caf50;
-        }
-        .actions {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .btn {
-            padding: 8px 16px;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 13px;
-            font-weight: 500;
-            transition: all 0.2s;
-        }
-        .btn-primary { background: #4285f4; color: #fff; }
-        .btn-primary:hover { background: #3367d6; }
-        .btn-success { background: #34a853; color: #fff; }
-        .btn-success:hover { background: #2d8f47; }
-        .btn-danger { background: #ea4335; color: #fff; }
-        .btn-danger:hover { background: #c5221f; }
-        .btn-secondary { background: #333; color: #fff; }
-        .btn-secondary:hover { background: #444; }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-        .progress-wrap {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .progress-bar {
-            width: 180px;
-            height: 6px;
-            background: #333;
-            border-radius: 3px;
-            overflow: hidden;
-        }
-        .progress-fill {
-            height: 100%;
-            width: 0%;
-            background: #4285f4;
-            transition: width 0.3s;
-        }
-        .progress-text {
-            font-size: 12px;
-            color: #888;
-            min-width: 52px;
-            text-align: right;
-        }
-
-        .empty-state {
-            text-align: center;
-            padding: 60px 20px;
-            color: #666;
-        }
-        .empty-state .icon {
-            font-size: 48px;
-            margin-bottom: 16px;
-        }
-
-        .profile-input {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 20px;
-        }
-        .profile-input input {
-            flex: 1;
-            padding: 12px 16px;
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            color: #fff;
-            font-size: 14px;
-        }
-        .profile-input input:focus {
-            outline: none;
-            border-color: #4285f4;
-        }
-
-        /* 设置卡片（安装路径） */
-        .settings-card {
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            padding: 16px 18px;
-            margin-bottom: 20px;
-        }
-        .settings-title {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            font-size: 15px;
-            font-weight: 600;
-            color: #fff;
-            margin-bottom: 8px;
-        }
-        .settings-actions {
-            display: flex;
-            gap: 8px;
-            margin-top: 12px;
-        }
-
-        .stats {
-            display: flex;
-            gap: 16px;
-            margin-bottom: 24px;
-        }
-        .stat-card {
-            flex: 1;
-            padding: 16px;
-            background: #1a1a1a;
-            border: 1px solid #333;
-            border-radius: 8px;
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 24px;
-            font-weight: 700;
-            color: #4285f4;
-        }
-        .stat-label {
-            font-size: 12px;
-            color: #888;
-            margin-top: 4px;
-        }
-
-        select.btn { padding: 8px; }
-
-        .load-more {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 12px;
-            padding: 16px;
-        }
-        .load-more-info {
-            font-size: 13px;
-            color: #888;
-        }
-
-        .toast {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            padding: 12px 20px;
-            background: #333;
-            border-radius: 8px;
-            color: #fff;
-            z-index: 1000;
-            transform: translateY(100px);
-            opacity: 0;
-            transition: all 0.3s;
-        }
-        .toast.show {
-            transform: translateY(0);
-            opacity: 1;
-        }
-    </style>
+    <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="container">
-        <h1><span>Chrome</span>Tester</h1>
+    <div class="app">
+        <!-- ============ 侧边栏 ============ -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-mark"></div>
+                <div class="brand-text">Chrome<span>Tester</span></div>
+            </div>
 
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-value" id="availableCount">-</div>
-                <div class="stat-label">可用版本</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="installedCount">-</div>
-                <div class="stat-label">已安装</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="profileCount">-</div>
-                <div class="stat-label">配置数</div>
-            </div>
-        </div>
+            <nav class="nav">
+                <button class="nav-item active" data-panel="available">
+                    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v18M3 12h18" stroke-linecap="round"/><circle cx="12" cy="12" r="9"/></svg>
+                    <span class="lbl">可用版本</span>
+                    <span class="cnt" id="cntAvailable">–</span>
+                </button>
+                <button class="nav-item" data-panel="installed">
+                    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 8v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8M3 8l2-4h14l2 4M3 8h18M10 12h4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    <span class="lbl">已安装</span>
+                    <span class="cnt" id="cntInstalled">–</span>
+                </button>
+                <button class="nav-item" data-panel="settings">
+                    <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-2.9 1.09V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 8 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 3.6 15a1.65 1.65 0 0 0-1.51-1H2a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 3.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 8 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09A1.65 1.65 0 0 0 15 4.6a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                    <span class="lbl">配置</span>
+                    <span class="cnt" id="cntProfiles">–</span>
+                </button>
+            </nav>
 
-        <div class="tabs">
-            <div class="tab active" data-panel="available">可用版本</div>
-            <div class="tab" data-panel="installed">已安装</div>
-            <div class="tab" data-panel="profiles">配置管理</div>
-        </div>
-
-        <!-- 可用版本面板 -->
-        <div class="panel active" id="available">
-            <div class="source-switch">
-                <div class="source-btn active" data-source="chrome">Chrome 正式构建 (M113+)</div>
-                <div class="source-btn" data-source="chromium">Chromium 历史版本 (M59~M112)</div>
-            </div>
-            <div class="hint" id="sourceHint">数据源：Chrome for Testing 官方构建，仅提供 M113（2023年）及之后的版本；更早的版本请切换到「Chromium 历史版本」。</div>
-            <input type="text" class="search-box" id="searchAvailable"
-                   placeholder="搜索版本号 (如: 114, 100.0.4896)">
-            <div class="group-layout">
-                <div class="major-list" id="majorList"></div>
-                <div class="version-list" id="availableList"></div>
-            </div>
-        </div>
-
-        <!-- 已安装面板 -->
-        <div class="panel" id="installed">
-            <input type="text" class="search-box" id="searchInstalled"
-                   placeholder="搜索已安装版本">
-            <div class="version-list" id="installedList"></div>
-        </div>
-
-        <!-- 配置管理面板 -->
-        <div class="panel" id="profiles">
-            <div class="settings-card">
-                <div class="settings-title">下载源</div>
-                <div class="source-switch" style="margin-bottom:0;">
-                    <div class="dlsource-btn" data-dlsource="google">Google 官方（需梯子）</div>
-                    <div class="dlsource-btn" data-dlsource="npmmirror">国内镜像 npmmirror（免梯子）</div>
-                </div>
-                <div class="hint" style="margin: 10px 0 0;">国内镜像由 npmmirror（淘宝）提供，直连下载无需梯子。注：Chromium 历史版本的里程碑列表首次仍需一次可访问 Google 的网络以建立缓存，之后即可免梯子下载。</div>
-            </div>
-            <div class="settings-card">
-                <div class="settings-title">
-                    安装路径
-                    <span class="version-badge" id="installDirBadge" style="display:none;background:#1a2f52;color:#8ab4f8;">自定义</span>
-                </div>
-                <div class="version-path" id="installDirPath" title="点击在文件管理器中打开" onclick="openInstallDir()">加载中...</div>
-                <div class="settings-actions">
-                    <button class="btn btn-primary" onclick="changeInstallDir()">修改路径</button>
-                    <button class="btn btn-secondary" onclick="resetInstallDir()">恢复默认</button>
-                </div>
-                <div class="hint" style="margin: 10px 0 0;">修改后新下载的版本将存放到新目录；已下载的版本不会自动迁移，可手动将旧目录中的版本文件夹移到新目录后刷新。</div>
-            </div>
-            <div class="settings-card">
-                <div class="settings-title">浏览器配置（Profile 数据隔离）</div>
-                <div class="hint">每个配置对应一份独立的浏览器数据（Cookie / 书签 / 登录状态 / 缓存 / 扩展互不干扰）。在「已安装」页启动某个版本时，可用下拉框选择用哪个配置打开，从而实现多账号、多环境的隔离测试。「default」为内置默认配置，首次启动时自动创建。</div>
-                <div class="profile-input" style="margin: 12px 0 0;">
-                    <input type="text" id="newProfileName" placeholder="输入配置名称（字母 / 数字 / 下划线 / 连字符）">
-                    <button class="btn btn-primary" onclick="createProfile()">创建配置</button>
+            <div class="sidebar-foot">
+                <button class="theme-toggle" id="themeToggle">
+                    <svg class="ico" id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"></svg>
+                    <span id="themeLabel">跟随系统</span>
+                </button>
+                <div class="foot-meta">
+                    <span id="appVer">v–</span>
+                    <button class="link-btn" id="checkUpdate">检查更新</button>
                 </div>
             </div>
-            <div class="version-list" id="profileList"></div>
-        </div>
+        </aside>
+
+        <!-- ============ 内容区 ============ -->
+        <main class="content">
+            <!-- 可用版本 -->
+            <section class="panel active" id="available">
+                <div class="topbar" style="padding-left:0;padding-right:0">
+                    <div>
+                        <h1>可用版本</h1>
+                        <div class="sub" id="availableSub">选择版本下载。数据来自本地快照，点刷新获取最新。</div>
+                    </div>
+                    <div class="topbar-actions">
+                        <div class="seg" id="kindSeg">
+                            <button class="on" data-kind="chrome">Chrome M113+</button>
+                            <button data-kind="chromium">Chromium 历史</button>
+                        </div>
+                        <button class="btn icon" id="refreshBtn" title="刷新最新版本列表">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="search">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5" stroke-linecap="round"/></svg>
+                    <input type="text" id="searchAvailable" placeholder="搜索版本号 (如 114 / 100.0.4896)">
+                </div>
+                <div class="grouped">
+                    <div class="majors" id="majorList"></div>
+                    <div class="list" id="availableList"></div>
+                </div>
+            </section>
+
+            <!-- 已安装 -->
+            <section class="panel" id="installed">
+                <div class="topbar" style="padding-left:0;padding-right:0">
+                    <div>
+                        <h1>已安装</h1>
+                        <div class="sub">扫描所有安装路径（含历史路径）。选择配置后启动。</div>
+                    </div>
+                </div>
+                <div class="search">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5" stroke-linecap="round"/></svg>
+                    <input type="text" id="searchInstalled" placeholder="搜索已安装版本">
+                </div>
+                <div class="list" id="installedList"></div>
+            </section>
+
+            <!-- 配置/设置 -->
+            <section class="panel" id="settings">
+                <div class="topbar" style="padding-left:0;padding-right:0">
+                    <div>
+                        <h1>配置</h1>
+                        <div class="sub">下载源、安装路径与浏览器配置（数据隔离 + 启动参数）。</div>
+                    </div>
+                </div>
+                <div class="settings-scroll">
+                    <div class="card">
+                        <h3>下载源</h3>
+                        <div class="seg" id="sourceSeg" style="margin:8px 0">
+                            <button data-src="google">Google 官方 · 需梯子</button>
+                            <button data-src="npmmirror">国内镜像 npmmirror · 免梯子</button>
+                        </div>
+                        <div class="hint">镜像由 npmmirror（淘宝）提供，直连下载无需梯子。Chromium 历史里程碑首次刷新需可访问 Google，之后走内置快照/缓存。</div>
+                    </div>
+
+                    <div class="card">
+                        <h3>安装路径 <span class="tag kind" id="dirBadge" style="display:none">自定义</span></h3>
+                        <div class="path" id="installDir" title="点击打开目录">加载中…</div>
+                        <div class="card-actions">
+                            <button class="btn" id="changeDir">修改路径</button>
+                            <button class="btn ghost" id="resetDir">恢复默认</button>
+                        </div>
+                        <div class="hint" style="margin-top:10px">切换路径后，旧目录的版本仍会在「已安装」中扫描显示，无需手动搬迁。</div>
+                    </div>
+
+                    <div class="card">
+                        <h3>浏览器配置 (Profile)</h3>
+                        <div class="hint block">每个配置 = 一份独立浏览器数据（Cookie/书签/登录/缓存隔离）+ 一组自定义启动参数。启动某版本时在下拉框选择使用哪个配置。</div>
+                        <div class="create-row">
+                            <input type="text" id="newProfileName" placeholder="新配置名称（字母/数字/下划线/连字符）">
+                            <button class="btn primary" id="createProfile">创建</button>
+                        </div>
+                        <div id="profileList"></div>
+                    </div>
+                </div>
+            </section>
+        </main>
     </div>
 
+    <div class="modal-overlay" id="modalOverlay">
+        <div class="modal">
+            <div class="modal-title" id="modalTitle">确认</div>
+            <div class="modal-msg" id="modalMsg"></div>
+            <div class="modal-actions">
+                <button class="btn ghost" id="modalCancel">取消</button>
+                <button class="btn primary" id="modalOk">确定</button>
+            </div>
+        </div>
+    </div>
     <div class="toast" id="toast"></div>
-
     <script src="app.js"></script>
 </body>
 </html>
