@@ -1,6 +1,6 @@
 [package]
 name = "chrometester"
-version = "0.1.0"
+version = "0.1.1"
 description = "ChromeTester - Chrome/Chromium 多版本下载与管理工具"
 edition = "2021"
 
@@ -24,6 +24,7 @@ sysinfo = "0.30"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [profile.release]
 strip = true

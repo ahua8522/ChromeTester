@@ -542,6 +542,32 @@ listen('update-progress', (ev) => {
     }
 });
 
+// ---------- 导入本地包（离线/内网迁移） ----------
+async function doImport(kind) {
+    const btnZip = $('importZip'), btnFolder = $('importFolder');
+    let src;
+    try {
+        src = await invoke(kind === 'zip' ? 'pick_import_zip' : 'pick_import_folder');
+    } catch (e) { toast('选择失败: ' + e); return; }
+    if (!src) return; // 用户取消
+    const btn = kind === 'zip' ? btnZip : btnFolder;
+    const old = btn.textContent;
+    btnZip.disabled = true; btnFolder.disabled = true;
+    btn.textContent = '导入中…';
+    try {
+        const version = await invoke('import_package', { source: src, versionHint: '' });
+        toast('已导入版本 ' + version);
+        loadInstalled();
+    } catch (e) {
+        toast('导入失败: ' + e);
+    } finally {
+        btn.textContent = old;
+        btnZip.disabled = false; btnFolder.disabled = false;
+    }
+}
+$('importZip').addEventListener('click', () => doImport('zip'));
+$('importFolder').addEventListener('click', () => doImport('folder'));
+
 // ---------- 初始化 ----------
 loadProfiles();
 loadInstalled();

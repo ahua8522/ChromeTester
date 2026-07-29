@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -185,6 +185,149 @@ fn record_install_dir(cfg: &mut serde_json::Value, path: &str) {
             arr.push(serde_json::json!(path));
         }
     }
+}
+
+/// 在版本目录中定位 chrome 可执行文件：先查固定候选，再有限深度递归兜底（兼容导入的任意结构）
+fn find_chrome_exe(base: &Path) -> Option<PathBuf> {
+    let candidates = [
+        base.join("chrome-win64").join("chrome.exe"),
+        base.join("chrome-win32").join("chrome.exe"),
+        base.join("chrome-win").join("chrome.exe"),
+        base.join("chrome.exe"),
+        base.join("chrome-linux64").join("chrome"),
+        base.join("chrome-linux").join("chrome"),
+        base.join("chrome-mac-arm64")
+            .join("Google Chrome for Testing.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("Google Chrome for Testing"),
+        base.join("chrome-mac")
+            .join("Chromium.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("Chromium"),
+    ];
+    if let Some(p) = candidates.iter().find(|p| p.exists()) {
+        return Some(p.clone());
+    }
+    find_exe_recursive(base, 4)
+}
+
+/// 有限深度递归查找 chrome 可执行文件
+fn find_exe_recursive(dir: &Path, depth: u32) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_file() {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                #[cfg(windows)]
+                let hit = name.eq_ignore_ascii_case("chrome.exe");
+                #[cfg(not(windows))]
+                let hit = name == "chrome" || name == "Chromium" || name == "Google Chrome for Testing";
+                if hit {
+                    return Some(p);
+                }
+            }
+        } else if p.is_dir() {
+            subdirs.push(p);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    for d in subdirs {
+        if let Some(f) = find_exe_recursive(&d, depth - 1) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// 是否形如版本号（如 120.0.6099.109）
+fn is_version_string(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() >= 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// 从 chrome.exe 所在目录旁的“版本号子目录”探测版本（Chrome/Chromium 会把 DLL 放在版本名目录中）
+fn detect_version_near_exe(exe: &Path) -> Option<String> {
+    let dir = exe.parent()?;
+    for e in fs::read_dir(dir).ok()?.flatten() {
+        if e.path().is_dir() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if is_version_string(&name) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// 读取 PE 版本资源中的产品版本（chrome.exe 内嵌的真实版本号，最可靠）
+#[cfg(windows)]
+fn exe_product_version(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut handle: u32 = 0;
+        let size = GetFileVersionInfoSizeW(wide.as_ptr(), &mut handle);
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        if GetFileVersionInfoW(wide.as_ptr(), 0, size, buf.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let mut info_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut len: u32 = 0;
+        let root: [u16; 2] = [b'\\' as u16, 0];
+        if VerQueryValueW(buf.as_ptr().cast(), root.as_ptr(), &mut info_ptr, &mut len) == 0
+            || info_ptr.is_null()
+            || (len as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>()
+        {
+            return None;
+        }
+        let info = &*(info_ptr as *const VS_FIXEDFILEINFO);
+        if info.dwSignature != 0xFEEF_04BD {
+            return None;
+        }
+        let (ms, ls) = (info.dwProductVersionMS, info.dwProductVersionLS);
+        let v = format!("{}.{}.{}.{}", ms >> 16, ms & 0xffff, ls >> 16, ls & 0xffff);
+        if v == "0.0.0.0" {
+            return None;
+        }
+        Some(v)
+    }
+}
+
+#[cfg(not(windows))]
+fn exe_product_version(_path: &Path) -> Option<String> {
+    None
+}
+
+/// 递归复制目录内容
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else if ty.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// 当前平台标识（与Chrome for Testing API对应）
@@ -473,6 +616,9 @@ fn get_installed_versions(app: AppHandle) -> Result<Vec<InstalledVersion>, Strin
                 continue;
             }
             let version = entry.file_name().to_string_lossy().to_string();
+            if version.starts_with('.') {
+                continue; // 跳过隐藏/导入临时目录
+            }
             if seen.contains(&version) {
                 continue;
             }
@@ -1121,6 +1267,149 @@ fn kill_chrome_using_profile(profile_path: &PathBuf) {
     }
 }
 
+/// 选择要导入的 zip 包
+#[tauri::command]
+async fn pick_import_zip() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择要导入的浏览器 zip 包")
+            .add_filter("Zip 压缩包", &["zip"])
+            .pick_file()
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 选择要导入的文件夹（已解压的浏览器目录）
+#[tauri::command]
+async fn pick_import_folder() -> Result<Option<String>, String> {
+    tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("选择要导入的浏览器文件夹")
+            .pick_folder()
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// 导入本地已有的浏览器包（zip 或已解压文件夹）到版本库，用于离线/内网迁移。
+/// 自动探测版本号（优先用 version_hint），返回最终版本名。
+#[tauri::command]
+async fn import_package(
+    app: AppHandle,
+    source: String,
+    version_hint: String,
+) -> Result<String, String> {
+    let src = PathBuf::from(&source);
+    if !src.exists() {
+        return Err("源路径不存在".into());
+    }
+    let is_zip = src.is_file()
+        && src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("zip"))
+            .unwrap_or(false);
+    if !is_zip && !src.is_dir() {
+        return Err("请选择 .zip 包或文件夹".into());
+    }
+
+    let hint = version_hint.trim().to_string();
+    let install_root = chrome_dir(&app)?;
+
+    tokio::task::spawn_blocking(move || -> Result<String, String> {
+        // 1. 准备解压/定位目录
+        let staging: PathBuf;
+        let cleanup_staging;
+        if is_zip {
+            let tmp = install_root.join(format!(".import-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&tmp);
+            fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+            let file = fs::File::open(&src).map_err(|e| e.to_string())?;
+            let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+            if let Err(e) = archive.extract(&tmp) {
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(format!("解压失败: {e}"));
+            }
+            staging = tmp;
+            cleanup_staging = true;
+        } else {
+            staging = src.clone();
+            cleanup_staging = false;
+        }
+
+        // 2. 定位 chrome.exe
+        let exe = match find_chrome_exe(&staging) {
+            Some(p) => p,
+            None => {
+                if cleanup_staging {
+                    let _ = fs::remove_dir_all(&staging);
+                }
+                return Err("未找到 chrome 可执行文件，可能不是有效的浏览器包".into());
+            }
+        };
+
+        // 3. 确定版本名：hint > exe内嵌产品版本（文件内容，最准） > 文件夹名(若是版本号) > exe旁版本目录 > 源名兜底
+        let folder_name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut version = if !hint.is_empty() {
+            hint.clone()
+        } else if let Some(v) = exe_product_version(&exe) {
+            v
+        } else if !is_zip && is_version_string(&folder_name) {
+            folder_name.clone()
+        } else if let Some(v) = detect_version_near_exe(&exe) {
+            v
+        } else if is_zip {
+            src.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "imported".into())
+        } else {
+            folder_name.clone()
+        };
+        version = version.trim().to_string();
+        if validate_version(&version).is_err() {
+            if cleanup_staging {
+                let _ = fs::remove_dir_all(&staging);
+            }
+            return Err(format!("无法确定合法版本名（探测到“{version}”），请用「指定版本名」重试"));
+        }
+
+        // 4. 目标目录
+        let target = install_root.join(&version);
+        if target.exists() {
+            if cleanup_staging {
+                let _ = fs::remove_dir_all(&staging);
+            }
+            return Err(format!("版本 {version} 已存在"));
+        }
+
+        // 5. 落地
+        if is_zip {
+            // staging 是临时目录，优先 rename（同盘极快），失败再复制
+            if fs::rename(&staging, &target).is_err() {
+                copy_dir_all(&staging, &target).map_err(|e| e.to_string())?;
+                let _ = fs::remove_dir_all(&staging);
+            }
+        } else {
+            copy_dir_all(&staging, &target).map_err(|e| e.to_string())?;
+        }
+
+        // 6. 校验可启动
+        if find_chrome_exe(&target).is_none() {
+            let _ = fs::remove_dir_all(&target);
+            return Err("导入后未能定位 chrome 可执行文件".into());
+        }
+        Ok(version)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn launch_chrome(app: AppHandle, version: String, profile: String) -> Result<(), String> {
     validate_version(&version)?;
@@ -1128,29 +1417,8 @@ fn launch_chrome(app: AppHandle, version: String, profile: String) -> Result<(),
 
     let base = find_version_dir(&app, &version).ok_or("未找到该版本目录")?;
 
-    // 尝试不同的目录结构定位chrome可执行文件（含Chromium快照的chrome-win等）
-    let candidates = [
-        base.join("chrome-win64").join("chrome.exe"),
-        base.join("chrome-win32").join("chrome.exe"),
-        base.join("chrome-win").join("chrome.exe"),
-        base.join("chrome.exe"),
-        base.join("chrome-linux64").join("chrome"),
-        base.join("chrome-linux").join("chrome"),
-        base.join("chrome-mac-arm64")
-            .join("Google Chrome for Testing.app")
-            .join("Contents")
-            .join("MacOS")
-            .join("Google Chrome for Testing"),
-        base.join("chrome-mac")
-            .join("Chromium.app")
-            .join("Contents")
-            .join("MacOS")
-            .join("Chromium"),
-    ];
-    let chrome_path = candidates
-        .iter()
-        .find(|p| p.exists())
-        .ok_or("未找到Chrome可执行文件")?;
+    // 定位 chrome 可执行文件（固定候选 + 有限递归兜底，兼容导入的任意结构）
+    let chrome_path = find_chrome_exe(&base).ok_or("未找到Chrome可执行文件")?;
 
     // 数据隔离：default 按版本独立目录（不同版本互不影响、可同时开）；命名配置跨版本共享
     let profile_path = if profile == "default" {
@@ -1163,7 +1431,7 @@ fn launch_chrome(app: AppHandle, version: String, profile: String) -> Result<(),
     // 启动前先结束该profile可能残留的旧实例，保证“关闭后再启动”总能打开新窗口
     kill_chrome_using_profile(&profile_path);
 
-    let mut cmd = Command::new(chrome_path);
+    let mut cmd = Command::new(&chrome_path);
     cmd.arg(format!("--user-data-dir={}", profile_path.display()))
         .arg("--no-first-run");
     // 追加该配置的自定义启动参数
@@ -1420,6 +1688,9 @@ pub fn run() {
             pick_install_dir,
             set_install_dir,
             open_install_dir,
+            pick_import_zip,
+            pick_import_folder,
+            import_package,
             list_profiles,
             create_profile,
             update_profile,
@@ -1433,4 +1704,24 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pe_product_version_reads_system_file() {
+        // kernel32.dll 在所有 Windows 上都有版本资源，用它验证 FFI 读取逻辑
+        let v = exe_product_version(Path::new("C:/Windows/System32/kernel32.dll"));
+        assert!(v.is_some(), "应能读取系统文件的产品版本");
+    }
+
+    #[test]
+    fn version_string_check() {
+        assert!(is_version_string("120.0.6099.109"));
+        assert!(is_version_string("65.0.3325"));
+        assert!(!is_version_string("chrome-win64"));
+        assert!(!is_version_string("120"));
+    }
 }
