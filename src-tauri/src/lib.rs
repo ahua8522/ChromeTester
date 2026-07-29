@@ -68,6 +68,8 @@ pub struct UpdateInfo {
     latest: String,
     has_update: bool,
     url: String,
+    /// 安装包（.exe）直链，用于直接下载更新
+    asset_url: String,
     notes: String,
 }
 
@@ -1188,9 +1190,50 @@ fn get_app_version() -> String {
 
 const GITHUB_REPO: &str = "ahua8522/ChromeTester";
 
+/// 从 atom 的单个 entry 中抽取发布说明（<content> 内为 HTML 转义），反转义并去标签转纯文本
+fn extract_notes(entry: &str) -> String {
+    let start = match entry.find("<content") {
+        Some(i) => i,
+        None => return String::new(),
+    };
+    let open_end = match entry[start..].find('>') {
+        Some(j) => start + j + 1,
+        None => return String::new(),
+    };
+    let end = entry[open_end..]
+        .find("</content>")
+        .map(|k| open_end + k)
+        .unwrap_or(entry.len());
+    let raw = &entry[open_end..end];
+    // HTML 实体反转义（&amp; 放最后）
+    let unescaped = raw
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    // 去 HTML 标签
+    let mut text = String::new();
+    let mut in_tag = false;
+    for ch in unescaped.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(ch),
+            _ => {}
+        }
+    }
+    // 折叠空行
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 检查 GitHub 最新 Release，与当前版本比较
 /// 用 releases.atom 而非 API：API 对未认证请求每 IP 每小时仅 60 次，共享代理出口易触顶返回 403；
-/// Atom 源不受此限制。条目按时间倒序，第一个 tag 即最新。
+/// Atom 源不受此限制。第一个 entry 即最新发布。
 #[tauri::command]
 async fn check_update() -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -1208,12 +1251,21 @@ async fn check_update() -> Result<UpdateInfo, String> {
     }
     let body = resp.text().await.map_err(|e| e.to_string())?;
 
-    // 提取第一个 /releases/tag/<tag>
+    // 取第一个 <entry>…</entry>（最新发布）
+    let entry = match body.find("<entry>") {
+        Some(i) => {
+            let end = body[i..].find("</entry>").map(|e| i + e).unwrap_or(body.len());
+            &body[i..end]
+        }
+        None => "",
+    };
+
+    // tag
     const MARK: &str = "/releases/tag/";
-    let tag = body
+    let tag = entry
         .find(MARK)
         .map(|i| {
-            let rest = &body[i + MARK.len()..];
+            let rest = &entry[i + MARK.len()..];
             let end = rest.find(['"', '<', '&']).unwrap_or(rest.len());
             rest[..end].to_string()
         })
@@ -1227,17 +1279,22 @@ async fn check_update() -> Result<UpdateInfo, String> {
             latest: current,
             has_update: false,
             url: releases_page,
+            asset_url: String::new(),
             notes: "远端尚无正式发布".into(),
         });
     }
 
+    let notes = extract_notes(entry);
+    let asset_url =
+        format!("https://github.com/{GITHUB_REPO}/releases/download/{tag}/ChromeTester_{latest}_x64-setup.exe");
     let has_update = version_key(&latest) > version_key(&current);
     Ok(UpdateInfo {
         current,
         latest,
         has_update,
         url: format!("{releases_page}/tag/{tag}"),
-        notes: String::new(),
+        asset_url,
+        notes,
     })
 }
 
@@ -1255,6 +1312,94 @@ fn open_url(url: String) -> Result<(), String> {
     let r = Command::new("xdg-open").arg(&url).spawn();
     r.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 下载更新安装包到本地 updates 目录，进度通过 update-progress 事件推送，返回本地路径
+#[tauri::command]
+async fn download_update(app: AppHandle, url: String) -> Result<String, String> {
+    // 仅允许本仓库的 release 附件
+    let prefix = format!("https://github.com/{GITHUB_REPO}/releases/download/");
+    if !url.starts_with(&prefix) {
+        return Err("非法下载地址".into());
+    }
+    let filename = url.rsplit('/').next().unwrap_or("ChromeTester-update.exe").to_string();
+    if !filename.ends_with(".exe") || filename.contains('/') || filename.contains('\\') {
+        return Err("非法文件名".into());
+    }
+    let dir = data_dir(&app)?.join("updates");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(&filename);
+
+    let emit = |status: &str, percent: u32, error: Option<String>| {
+        let _ = app.emit(
+            "update-progress",
+            DownloadProgress {
+                version: "update".into(),
+                status: status.into(),
+                percent,
+                error,
+            },
+        );
+    };
+
+    emit("downloading", 0, None);
+    let resp = download_client()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let e = format!("下载失败: HTTP {}", resp.status());
+        emit("error", 0, Some(e.clone()));
+        return Err(e);
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let result: Result<(), String> = async {
+        let mut file = fs::File::create(&path).map_err(|e| e.to_string())?;
+        let mut got: u64 = 0;
+        let mut last: u32 = 0;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            file.write_all(&chunk).map_err(|e| e.to_string())?;
+            got += chunk.len() as u64;
+            if total > 0 {
+                let p = (got * 100 / total) as u32;
+                if p != last {
+                    last = p;
+                    emit("downloading", p, None);
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        let _ = fs::remove_file(&path);
+        emit("error", 0, Some(e.clone()));
+        return Err(e);
+    }
+    emit("completed", 100, None);
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 运行已下载的安装包（仅限 updates 目录内的文件）
+#[tauri::command]
+fn open_installer(app: AppHandle, path: String) -> Result<(), String> {
+    let updates = data_dir(&app)?.join("updates");
+    let p = PathBuf::from(&path);
+    if !p.starts_with(&updates) || !p.exists() {
+        return Err("非法路径".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new(&p).spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("仅支持 Windows 自动安装".into())
+    }
 }
 
 pub fn run() {
@@ -1283,6 +1428,8 @@ pub fn run() {
             get_app_version,
             check_update,
             open_url,
+            download_update,
+            open_installer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

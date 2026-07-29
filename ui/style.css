@@ -368,6 +368,16 @@ select.mini {
 .modal-msg { color: var(--text-dim); font-size: 13.5px; line-height: 1.6; margin-bottom: 20px; word-break: break-word; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 
+/* 更新弹框 */
+.update-modal { width: min(480px, 90vw); }
+.update-ver { font-family: var(--font-mono); font-size: 13px; color: var(--text-dim); margin-bottom: 12px; }
+.update-ver b { color: var(--accent); font-weight: 650; }
+.update-notes { display: none; max-height: 258px; overflow: auto; margin: 0 0 16px; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.65; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.update-progress { display: none; align-items: center; gap: 10px; margin-bottom: 16px; }
+.update-progress .bar { flex: 1; height: 8px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.update-progress .fill { height: 100%; width: 0; background: var(--accent); transition: width .2s ease; }
+.update-progress .pct { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); min-width: 42px; text-align: right; }
+
 /* Toast — 右上角 */
 .toast {
     position: fixed; top: 16px; right: 16px;

@@ -449,20 +449,97 @@ $('createProfile').addEventListener('click', async () => {
 async function loadAppMeta() {
     try { $('appVer').textContent = 'v' + (await invoke('get_app_version')); } catch {}
 }
+// ---------- 检查更新（更新弹框） ----------
+const upOv = $('updateOverlay');
+let upDownloading = false;
+function closeUpdate() { if (upDownloading) return; upOv.classList.remove('show'); }
+upOv.addEventListener('mousedown', (e) => { if (e.target === upOv) closeUpdate(); });
+
 $('checkUpdate').addEventListener('click', async () => {
     const btn = $('checkUpdate');
     btn.textContent = '检查中…';
+    $('updateTitle').textContent = '检查更新';
+    $('updateVer').textContent = '正在检查…';
+    $('updateNotes').style.display = 'none';
+    $('updateNotes').textContent = '';
+    $('updateProgress').style.display = 'none';
+    $('updateActions').innerHTML = '';
+    upOv.classList.add('show');
     try {
         const u = await invoke('check_update');
-        if (u.has_update) {
-            btn.textContent = '→ v' + u.latest;
-            if (await confirmDialog(`发现新版本 v${u.latest}（当前 v${u.current}）。前往下载页？`, '发现新版本')) await invoke('open_url', { url: u.url });
-        } else {
-            toast(u.notes ? '已是最新 · ' + u.notes : '已是最新 v' + u.current);
-            btn.textContent = '已是最新';
-            setTimeout(() => { btn.textContent = '检查更新'; }, 3000);
-        }
-    } catch (e) { toast('检查更新失败: ' + e); btn.textContent = '检查更新'; }
+        renderUpdate(u);
+    } catch (e) {
+        $('updateVer').textContent = '检查失败：' + e;
+        $('updateActions').innerHTML = '<button class="btn primary" id="upErrClose">关闭</button>';
+        $('upErrClose').addEventListener('click', () => upOv.classList.remove('show'));
+    }
+    btn.textContent = '检查更新';
+});
+
+function renderUpdate(u) {
+    if (u.notes) { $('updateNotes').textContent = u.notes; $('updateNotes').style.display = 'block'; }
+    else { $('updateNotes').style.display = 'none'; }
+    $('updateProgress').style.display = 'none';
+    if (u.has_update) {
+        $('updateTitle').textContent = '发现新版本';
+        $('updateVer').innerHTML = `当前 v${esc(u.current)} → 最新 <b>v${esc(u.latest)}</b>`;
+        $('updateActions').innerHTML =
+            '<button class="btn ghost" data-up="close">取消</button>' +
+            '<button class="btn ghost" data-up="page">打开下载页</button>' +
+            '<button class="btn primary" data-up="dl">下载并更新</button>';
+    } else {
+        $('updateTitle').textContent = '已是最新';
+        $('updateVer').innerHTML = `当前已是最新版本 v${esc(u.current)}`;
+        $('updateActions').innerHTML =
+            '<button class="btn ghost" data-up="close">关闭</button>' +
+            '<button class="btn primary" data-up="page">打开下载页</button>';
+    }
+    $('updateActions').querySelectorAll('[data-up]').forEach((b) => {
+        b.addEventListener('click', async () => {
+            const act = b.dataset.up;
+            if (act === 'close') return closeUpdate();
+            if (act === 'page') {
+                try { await invoke('open_url', { url: u.url }); } catch (e) { toast('打开失败: ' + e); }
+                return upOv.classList.remove('show');
+            }
+            if (act === 'dl') return startUpdateDownload(u);
+        });
+    });
+}
+
+async function startUpdateDownload(u) {
+    if (!u.asset_url) { toast('未找到安装包地址'); return; }
+    upDownloading = true;
+    $('updateActions').innerHTML = '';
+    $('updateProgress').style.display = 'flex';
+    $('updateFill').style.width = '0%';
+    $('updatePct').textContent = '0%';
+    try {
+        const path = await invoke('download_update', { url: u.asset_url });
+        upDownloading = false;
+        $('updateFill').style.width = '100%';
+        $('updatePct').textContent = '完成';
+        $('updateActions').innerHTML =
+            '<button class="btn ghost" data-run="later">稍后</button>' +
+            '<button class="btn primary" data-run="run">立即安装</button>';
+        $('updateActions').querySelector('[data-run="later"]').addEventListener('click', () => upOv.classList.remove('show'));
+        $('updateActions').querySelector('[data-run="run"]').addEventListener('click', async () => {
+            try { await invoke('open_installer', { path }); toast('已启动安装程序，请按提示完成更新'); upOv.classList.remove('show'); }
+            catch (e) { toast('启动安装失败: ' + e); }
+        });
+    } catch (e) {
+        upDownloading = false;
+        toast('下载失败: ' + e);
+        renderUpdate(u);
+    }
+}
+
+listen('update-progress', (ev) => {
+    const p = ev.payload || {};
+    if (p.status === 'downloading') {
+        $('updateFill').style.width = (p.percent || 0) + '%';
+        $('updatePct').textContent = (p.percent || 0) + '%';
+    }
 });
 
 // ---------- 初始化 ----------
