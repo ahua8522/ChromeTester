@@ -1,8 +1,16 @@
 # ChromeTester
 
+[![Release](https://img.shields.io/github/v/release/ahua8522/ChromeTester?color=3b5bdb)](https://github.com/ahua8522/ChromeTester/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/ahua8522/ChromeTester/total?color=2f9468)](https://github.com/ahua8522/ChromeTester/releases)
+[![License](https://img.shields.io/github/license/ahua8522/ChromeTester)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20x64-blue)
+![Built with](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri-dd6b20)
+
 > 一个轻量级的 Chrome / Chromium 多版本下载、管理与启动工具，用于跨版本的兼容性与渲染测试。
 
 ChromeTester 是一款桌面客户端，帮助前端开发者、测试工程师在同一台机器上便捷地下载、管理并启动**多个不同版本**的 Chrome / Chromium，并通过独立的数据配置（Profile）实现多环境、多账号的隔离测试。
+
+📥 **下载**：前往 [Releases](https://github.com/ahua8522/ChromeTester/releases/latest) 下载最新的 `ChromeTester_x.y.z_x64-setup.exe` 安装即可。
 
 ---
 
@@ -33,6 +41,9 @@ ChromeTester 是一款桌面客户端，帮助前端开发者、测试工程师�
 - **本地版本库管理**：查看已安装版本、显示磁盘路径、一键在文件管理器中打开、删除。
 - **数据隔离（Profile）**：为不同版本/场景创建独立的浏览器数据目录，实现 Cookie、书签、登录状态、缓存、扩展互不干扰。
 - **自定义安装路径**：可将版本库存放到任意目录。
+- **内置版本快照**：版本列表随应用打包，启动即时展示、无需联网，可一键刷新获取最新。
+- **明暗主题**：极简中性配色，默认跟随系统，可手动切换浅色 / 深色。
+- **应用内检查更新**：读取 GitHub 最新发布，展示更新内容并可一键下载安装。
 - **原生桌面体验**：独立窗口、系统托盘图标级别的轻量占用（内存约 30–50MB）。
 
 ---
@@ -108,7 +119,8 @@ ChromeTester 是一款桌面客户端，帮助前端开发者、测试工程师�
 ```
 ChromeTester/
 ├── ui/                       # 前端（无需构建）
-│   ├── index.html            # 界面结构与样式
+│   ├── index.html            # 界面结构
+│   ├── style.css             # 样式（极简明暗主题）
 │   └── app.js                # 前端逻辑（Tauri IPC）
 ├── src-tauri/
 │   ├── Cargo.toml            # Rust 依赖
@@ -116,10 +128,12 @@ ChromeTester/
 │   ├── build.rs
 │   ├── capabilities/         # IPC 权限声明
 │   ├── icons/                # 应用图标
+│   ├── snapshot/             # 内置版本快照（Chrome 版本 / Chromium 里程碑）
 │   └── src/
 │       ├── main.rs           # 入口
 │       └── lib.rs            # 核心逻辑与全部 Command
 ├── make-icon.ps1             # 程序化生成图标脚本（可选）
+├── gen-snapshot.ps1          # 生成 / 更新内置版本快照（可选）
 └── README.md
 ```
 
@@ -167,8 +181,10 @@ pwsh -File make-icon.ps1
 ```
 %APPDATA%\com.cvm.app\
 ├── chrome/                 # 已下载的版本库（可在"配置管理"中改为自定义路径）
-├── profiles/               # 各配置（Profile）的独立浏览器数据
-├── config.json             # 下载源、安装路径等设置
+├── profiles/               # 各配置（Profile）的独立浏览器数据（default 按版本隔离）
+├── updates/                # 检查更新时下载的安装包
+├── config.json             # 下载源、安装路径、配置参数等设置
+├── versions-cache.json     # Chrome 版本列表缓存（刷新后写入）
 └── milestones-cache.json   # Chromium 里程碑缓存
 ```
 
@@ -194,7 +210,7 @@ A：官方 Google 源在国内通常需要代理。可在「配置管理 → 下
 
 ## 开源许可
 
-建议以 **MIT License** 开源本项目自身的代码（仓库根目录可添加 `LICENSE` 文件）。
+本项目自身的代码以 **MIT License** 开源，详见仓库根目录的 [`LICENSE`](LICENSE) 文件。
 
 请注意：本许可仅适用于 **ChromeTester 自身的源代码**。通过本工具下载的 Chrome / Chromium 二进制文件各自遵循其对应的许可与条款（Chromium 为 BSD-3-Clause；Chrome for Testing 遵循 Google 的相关条款）。
 
