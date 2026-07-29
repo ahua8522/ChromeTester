@@ -1,6 +1,6 @@
 [package]
 name = "chrometester"
-version = "0.1.0"
+version = "0.1.1"
 description = "ChromeTester - Chrome/Chromium 多版本下载与管理工具"
 edition = "2021"
 

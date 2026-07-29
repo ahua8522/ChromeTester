@@ -1189,22 +1189,39 @@ fn get_app_version() -> String {
 const GITHUB_REPO: &str = "ahua8522/ChromeTester";
 
 /// 检查 GitHub 最新 Release，与当前版本比较
+/// 用 releases.atom 而非 API：API 对未认证请求每 IP 每小时仅 60 次，共享代理出口易触顶返回 403；
+/// Atom 源不受此限制。条目按时间倒序，第一个 tag 即最新。
 #[tauri::command]
 async fn check_update() -> Result<UpdateInfo, String> {
     let current = env!("CARGO_PKG_VERSION").to_string();
     let releases_page = format!("https://github.com/{GITHUB_REPO}/releases");
-    let api = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+    let atom = format!("{releases_page}.atom");
 
     let resp = http_client()
-        .get(&api)
+        .get(&atom)
         .header("User-Agent", "ChromeTester")
-        .header("Accept", "application/vnd.github+json")
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("检查失败: HTTP {}", resp.status()));
+    }
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+
+    // 提取第一个 /releases/tag/<tag>
+    const MARK: &str = "/releases/tag/";
+    let tag = body
+        .find(MARK)
+        .map(|i| {
+            let rest = &body[i + MARK.len()..];
+            let end = rest.find(['"', '<', '&']).unwrap_or(rest.len());
+            rest[..end].to_string()
+        })
+        .unwrap_or_default();
+    let latest = tag.trim_start_matches('v').to_string();
 
     // 尚未发布任何 Release
-    if resp.status().as_u16() == 404 {
+    if latest.is_empty() {
         return Ok(UpdateInfo {
             current: current.clone(),
             latest: current,
@@ -1213,26 +1230,14 @@ async fn check_update() -> Result<UpdateInfo, String> {
             notes: "远端尚无正式发布".into(),
         });
     }
-    if !resp.status().is_success() {
-        return Err(format!("检查失败: HTTP {}", resp.status()));
-    }
 
-    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let latest = data["tag_name"]
-        .as_str()
-        .unwrap_or("")
-        .trim_start_matches('v')
-        .to_string();
-    let url = data["html_url"].as_str().unwrap_or(&releases_page).to_string();
-    let notes: String = data["body"].as_str().unwrap_or("").chars().take(400).collect();
-    let has_update = !latest.is_empty() && version_key(&latest) > version_key(&current);
-
+    let has_update = version_key(&latest) > version_key(&current);
     Ok(UpdateInfo {
         current,
         latest,
         has_update,
-        url,
-        notes,
+        url: format!("{releases_page}/tag/{tag}"),
+        notes: String::new(),
     })
 }
 
